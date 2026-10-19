@@ -1,0 +1,13 @@
+App(
+    appid="paxton_sniffer",
+    name="Paxton Sniffer V1",
+    apptype=FlipperAppType.EXTERNAL,
+    targets=["f7"],
+    entry_point="paxton_sniffer_app",
+    stack_size=8 * 1024,
+    fap_category="RFID",
+    fap_version=(1, 0),
+    fap_author="Julien",
+    fap_description="Passive Paxton capture with confirmed E0/E8 reads",
+    sources=["paxton_sniffer.c", "hitag2_protocol.c", "hitag2_edge_decode.c"],
+)

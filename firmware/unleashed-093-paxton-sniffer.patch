@@ -1,0 +1,316 @@
+diff --git a/targets/f7/api_symbols.csv b/targets/f7/api_symbols.csv
+index 2df8aa9..1ef099b 100755
+--- a/targets/f7/api_symbols.csv
++++ b/targets/f7/api_symbols.csv
+@@ -1,5 +1,5 @@
+ entry,status,name,type,params
+-Version,+,88.9,,
++Version,+,88.11,,
+ Header,+,applications/drivers/subghz/cc1101_ext/cc1101_ext_interconnect.h,,
+ Header,+,applications/services/applications.h,,
+ Header,+,applications/services/bt/bt_service/bt.h,,
+@@ -1731,6 +1731,10 @@ Function,-,furi_hal_resources_init,void,
+ Function,-,furi_hal_resources_init_early,void,
+ Function,+,furi_hal_resources_pin_by_name,const GpioPinRecord*,const char*
+ Function,+,furi_hal_resources_pin_by_number,const GpioPinRecord*,uint8_t
++Function,+,furi_hal_rfid_adc_dma_start,void,"uint16_t*, size_t, uint32_t"
++Function,+,furi_hal_rfid_adc_dma_stop,void,
++Function,+,furi_hal_rfid_adc_dma_stream_start,void,"uint16_t*, size_t, uint32_t, FuriHalRfidDMACallback, void*"
++Function,+,furi_hal_rfid_adc_dma_wait_done,_Bool,uint32_t
+ Function,+,furi_hal_rfid_comp_set_callback,void,"FuriHalRfidCompCallback, void*"
+ Function,+,furi_hal_rfid_comp_start,void,
+ Function,+,furi_hal_rfid_comp_stop,void,
+diff --git a/targets/f7/furi_hal/furi_hal_rfid.c b/targets/f7/furi_hal/furi_hal_rfid.c
+index 34bb3a5..4004742 100644
+--- a/targets/f7/furi_hal/furi_hal_rfid.c
++++ b/targets/f7/furi_hal/furi_hal_rfid.c
+@@ -8,6 +8,8 @@
+ #include <stm32wbxx_ll_tim.h>
+ #include <stm32wbxx_ll_comp.h>
+ #include <stm32wbxx_ll_dma.h>
++#include <stm32wbxx_ll_adc.h>
++#include <furi_hal_adc.h>
+ 
+ #define FURI_HAL_RFID_READ_TIMER                TIM1
+ #define FURI_HAL_RFID_READ_TIMER_BUS            FuriHalBusTIM1
+@@ -171,6 +173,22 @@ static void furi_hal_rfid_pins_field(void) {
+         &gpio_rfid_carrier, GpioModeAltFunctionPushPull, GpioPullNo, GpioSpeedLow, GpioAltFn2TIM2);
+ }
+ 
++static void furi_hal_rfid_pins_passive_adc(void) {
++    // Match the V17 receive topology: it preserves the short reader field gaps.
++    furi_hal_ibutton_pin_configure();
++    furi_hal_ibutton_pin_write(false);
++
++    furi_hal_gpio_init(&gpio_nfc_irq_rfid_pull, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
++    furi_hal_gpio_write(&gpio_nfc_irq_rfid_pull, true);
++
++    furi_hal_gpio_init(&gpio_rfid_carrier_out, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
++    furi_hal_gpio_write(&gpio_rfid_carrier_out, false);
++
++    // TIM2 is the ADC trigger in this mode, so do not route RFID_CARRIER to it.
++    furi_hal_gpio_init_simple(&gpio_rfid_carrier, GpioModeAnalog);
++    furi_hal_gpio_init(&gpio_rfid_data_in, GpioModeAnalog, GpioPullNo, GpioSpeedLow);
++}
++
+ void furi_hal_rfid_pin_pull_release(void) {
+     furi_hal_gpio_write(&gpio_nfc_irq_rfid_pull, true);
+ }
+@@ -588,3 +606,209 @@ bool furi_hal_rfid_field_is_present(uint32_t* frequency) {
+     return (*frequency >= FURI_HAL_RFID_FIELD_FREQUENCY_MIN) &&
+            (*frequency <= FURI_HAL_RFID_FIELD_FREQUENCY_MAX);
+ }
++static FuriHalAdcHandle* rfid_adc_handle = NULL;
++static FuriHalRfidDMACallback rfid_adc_dma_callback = NULL;
++static void* rfid_adc_dma_context = NULL;
++static bool rfid_adc_oneshot_active;
++static bool rfid_adc_oneshot_done;
++
++static void furi_hal_rfid_adc_dma_isr(void* context) {
++    UNUSED(context);
++
++    if(LL_DMA_IsActiveFlag_HT1(DMA1)) {
++        LL_DMA_ClearFlag_HT1(DMA1);
++        if(rfid_adc_dma_callback) {
++            rfid_adc_dma_callback(true, rfid_adc_dma_context);
++        }
++    }
++
++    if(LL_DMA_IsActiveFlag_TC1(DMA1)) {
++        LL_DMA_ClearFlag_TC1(DMA1);
++        if(rfid_adc_dma_callback) {
++            rfid_adc_dma_callback(false, rfid_adc_dma_context);
++        }
++    }
++
++    if(LL_DMA_IsActiveFlag_TE1(DMA1)) {
++        LL_DMA_ClearFlag_TE1(DMA1);
++    }
++}
++
++void furi_hal_rfid_adc_dma_stop(void) {
++    LL_TIM_DisableCounter(TIM2);
++
++    if(LL_ADC_REG_IsConversionOngoing(ADC1)) {
++        LL_ADC_REG_StopConversion(ADC1);
++        uint32_t timeout = 10000;
++        while(LL_ADC_REG_IsConversionOngoing(ADC1) && timeout--) {
++            // wait
++        }
++    }
++
++    LL_DMA_DisableChannel(DMA1, LL_DMA_CHANNEL_1);
++    LL_DMA_DisableIT_TC(DMA1, LL_DMA_CHANNEL_1);
++    LL_DMA_DisableIT_HT(DMA1, LL_DMA_CHANNEL_1);
++    LL_DMA_DisableIT_TE(DMA1, LL_DMA_CHANNEL_1);
++    LL_DMA_ClearFlag_TC1(DMA1);
++    LL_DMA_ClearFlag_HT1(DMA1);
++    LL_DMA_ClearFlag_TE1(DMA1);
++    furi_hal_interrupt_set_isr(FuriHalInterruptIdDma1Ch1, NULL, NULL);
++
++    LL_ADC_REG_SetTriggerSource(ADC1, LL_ADC_REG_TRIG_SOFTWARE);
++    LL_ADC_REG_SetDMATransfer(ADC1, LL_ADC_REG_DMA_TRANSFER_NONE);
++
++    if(rfid_adc_handle) {
++        furi_hal_adc_release(rfid_adc_handle);
++        rfid_adc_handle = NULL;
++    }
++
++    if(furi_hal_bus_is_enabled(FuriHalBusDMA1)) {
++        furi_hal_bus_disable(FuriHalBusDMA1);
++    }
++    if(furi_hal_bus_is_enabled(FuriHalBusTIM2)) {
++        furi_hal_bus_disable(FuriHalBusTIM2);
++    }
++
++    rfid_adc_dma_callback = NULL;
++    rfid_adc_dma_context = NULL;
++    rfid_adc_oneshot_active = false;
++    rfid_adc_oneshot_done = false;
++}
++
++static void furi_hal_rfid_adc_dma_start_ex(
++    uint16_t* buffer,
++    size_t samples,
++    uint32_t sample_rate,
++    bool circular,
++    bool passive_rx,
++    FuriHalRfidDMACallback callback,
++    void* context) {
++    furi_check(buffer);
++    furi_check(samples > 0);
++    furi_check(samples <= UINT16_MAX);
++    furi_check(sample_rate > 0);
++    if(circular) {
++        furi_check((samples % 2) == 0);
++        furi_check(callback);
++    }
++
++    furi_hal_rfid_adc_dma_stop();
++    if(passive_rx) {
++        furi_hal_rfid_comp_stop();
++        furi_hal_rfid_pins_passive_adc();
++    }
++    rfid_adc_dma_callback = callback;
++    rfid_adc_dma_context = context;
++
++    // Acquire and configure ADC via standard HAL (handles VREF, calibration, clock, and mutex)
++    rfid_adc_handle = furi_hal_adc_acquire();
++
++    // Use extended configure to set no oversampling, otherwise sampling is very slow
++    furi_hal_adc_configure_ex(
++        rfid_adc_handle,
++        FuriHalAdcScale2048,
++        FuriHalAdcClockSync64,
++        FuriHalAdcOversampleNone,
++        FuriHalAdcSamplingtime6_5);
++
++    if(!furi_hal_bus_is_enabled(FuriHalBusDMA1)) {
++        furi_hal_bus_enable(FuriHalBusDMA1);
++    }
++    if(!furi_hal_bus_is_enabled(FuriHalBusTIM2)) {
++        furi_hal_bus_enable(FuriHalBusTIM2);
++    }
++
++    furi_hal_gpio_init(&gpio_rfid_data_in, GpioModeAnalog, GpioPullNo, GpioSpeedLow);
++
++    LL_TIM_DisableCounter(TIM2);
++    LL_TIM_SetPrescaler(TIM2, 0);
++    LL_TIM_SetCounterMode(TIM2, LL_TIM_COUNTERMODE_UP);
++
++    uint32_t arr = SystemCoreClock / sample_rate;
++    furi_check(arr > 0);
++    LL_TIM_SetAutoReload(TIM2, arr - 1);
++
++    LL_TIM_SetClockDivision(TIM2, LL_TIM_CLOCKDIVISION_DIV1);
++    LL_TIM_SetClockSource(TIM2, LL_TIM_CLOCKSOURCE_INTERNAL);
++    LL_TIM_SetTriggerOutput(TIM2, LL_TIM_TRGO_UPDATE);
++
++    LL_DMA_DeInit(DMA1, LL_DMA_CHANNEL_1);
++    LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_CHANNEL_1, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
++    LL_DMA_SetChannelPriorityLevel(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PRIORITY_HIGH);
++    LL_DMA_SetMode(DMA1, LL_DMA_CHANNEL_1, circular ? LL_DMA_MODE_CIRCULAR : LL_DMA_MODE_NORMAL);
++    LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PERIPH_NOINCREMENT);
++    LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MEMORY_INCREMENT);
++    LL_DMA_SetPeriphSize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_PDATAALIGN_HALFWORD);
++    LL_DMA_SetMemorySize(DMA1, LL_DMA_CHANNEL_1, LL_DMA_MDATAALIGN_HALFWORD);
++    LL_DMA_SetPeriphRequest(DMA1, LL_DMA_CHANNEL_1, LL_DMAMUX_REQ_ADC1);
++
++    LL_DMA_SetPeriphAddress(DMA1, LL_DMA_CHANNEL_1, LL_ADC_DMA_GetRegAddr(ADC1, LL_ADC_DMA_REG_REGULAR_DATA));
++    LL_DMA_SetMemoryAddress(DMA1, LL_DMA_CHANNEL_1, (uint32_t)buffer);
++    LL_DMA_SetDataLength(DMA1, LL_DMA_CHANNEL_1, samples);
++
++    LL_DMA_ClearFlag_TC1(DMA1);
++    LL_DMA_ClearFlag_HT1(DMA1);
++    LL_DMA_ClearFlag_TE1(DMA1);
++    LL_DMA_EnableChannel(DMA1, LL_DMA_CHANNEL_1);
++    if(circular) {
++        furi_hal_interrupt_set_isr(FuriHalInterruptIdDma1Ch1, furi_hal_rfid_adc_dma_isr, NULL);
++        LL_DMA_EnableIT_TC(DMA1, LL_DMA_CHANNEL_1);
++        LL_DMA_EnableIT_HT(DMA1, LL_DMA_CHANNEL_1);
++        LL_DMA_EnableIT_TE(DMA1, LL_DMA_CHANNEL_1);
++    }
++
++    if(LL_ADC_REG_IsConversionOngoing(ADC1)) {
++        LL_ADC_REG_StopConversion(ADC1);
++        uint32_t timeout = 10000;
++        while(LL_ADC_REG_IsConversionOngoing(ADC1) && timeout--) {
++            // wait
++        }
++    }
++
++    LL_ADC_SetResolution(ADC1, LL_ADC_RESOLUTION_12B);
++    LL_ADC_SetChannelSamplingTime(ADC1, LL_ADC_CHANNEL_14, LL_ADC_SAMPLINGTIME_6CYCLES_5);
++    LL_ADC_REG_SetSequencerRanks(ADC1, LL_ADC_REG_RANK_1, LL_ADC_CHANNEL_14);
++
++    LL_ADC_REG_SetContinuousMode(ADC1, LL_ADC_REG_CONV_SINGLE);
++    LL_ADC_REG_SetTriggerSource(ADC1, LL_ADC_REG_TRIG_EXT_TIM2_TRGO);
++    LL_ADC_REG_SetTriggerEdge(ADC1, LL_ADC_REG_TRIG_EXT_RISING);
++    LL_ADC_REG_SetDMATransfer(
++        ADC1, circular ? LL_ADC_REG_DMA_TRANSFER_UNLIMITED : LL_ADC_REG_DMA_TRANSFER_LIMITED);
++
++    LL_ADC_ClearFlag_EOC(ADC1);
++    LL_ADC_ClearFlag_OVR(ADC1);
++    LL_ADC_REG_StartConversion(ADC1);
++
++    LL_TIM_SetCounter(TIM2, 0);
++    rfid_adc_oneshot_active = !circular;
++    LL_TIM_EnableCounter(TIM2);
++}
++
++void furi_hal_rfid_adc_dma_stream_start(
++    uint16_t* buffer,
++    size_t samples,
++    uint32_t sample_rate,
++    FuriHalRfidDMACallback callback,
++    void* context) {
++    furi_hal_rfid_adc_dma_start_ex(buffer, samples, sample_rate, true, true, callback, context);
++}
++
++void furi_hal_rfid_adc_dma_start(uint16_t* buffer, size_t samples, uint32_t sample_rate) {
++    /* Preserve TIM1 and the existing RF output pin configuration. */
++    furi_hal_rfid_adc_dma_start_ex(buffer, samples, sample_rate, false, false, NULL, NULL);
++}
++
++bool furi_hal_rfid_adc_dma_wait_done(uint32_t timeout_ms) {
++    if(!rfid_adc_oneshot_active) return false;
++    if(rfid_adc_oneshot_done) return true;
++    uint32_t start = furi_get_tick();
++    while(!LL_DMA_IsActiveFlag_TC1(DMA1)) {
++        if(LL_DMA_IsActiveFlag_TE1(DMA1)) return false;
++        if(furi_get_tick() - start >= timeout_ms) return false;
++        furi_delay_us(100U);
++    }
++    LL_TIM_DisableCounter(TIM2);
++    LL_DMA_ClearFlag_TC1(DMA1);
++    rfid_adc_oneshot_done = true;
++    return true;
++}
+diff --git a/targets/f7/furi_hal/furi_hal_rfid.h b/targets/f7/furi_hal/furi_hal_rfid.h
+index 216e0d9..17a9bd4 100644
+--- a/targets/f7/furi_hal/furi_hal_rfid.h
++++ b/targets/f7/furi_hal/furi_hal_rfid.h
+@@ -101,6 +101,43 @@ void furi_hal_rfid_field_detect_stop(void);
+  */
+ bool furi_hal_rfid_field_is_present(uint32_t* frequency);
+ 
++/** Start continuous ADC DMA capture triggered by TIM2
++ *
++ * The DMA runs in circular mode. Callback is called at half-buffer and
++ * full-buffer boundaries with the same boolean convention as RFID DMA
++ * callbacks: true for first half, false for second half.
++ *
++ * This is a passive receive path. RFID_PULL is held high to preserve the
++ * short reader field gaps observed with the V17 topology, while RFID_OUT is
++ * driven low. RFID_CARRIER remains analog because TIM2 is used as ADC trigger.
++ *
++ * @param buffer       Destination buffer for 12-bit ADC samples
++ * @param samples      Number of samples in the circular buffer, must be even
++ * @param sample_rate  Sampling rate in Hz (e.g. 500000 or 1000000)
++ * @param callback     Half/full buffer callback
++ * @param context      User context passed to callback
++ */
++void furi_hal_rfid_adc_dma_stream_start(
++    uint16_t* buffer,
++    size_t samples,
++    uint32_t sample_rate,
++    FuriHalRfidDMACallback callback,
++    void* context);
++
++/** Stop ADC DMA capture
++ */
++void furi_hal_rfid_adc_dma_stop(void);
++
++/** Start a bounded ADC DMA capture without changing TIM1 or the RF output pins.
++ * The caller owns the active carrier and must stop it separately.
++ */
++void furi_hal_rfid_adc_dma_start(uint16_t* buffer, size_t samples, uint32_t sample_rate);
++
++/** Wait for a bounded capture to complete. Does not stop the RF carrier.
++ * Call from thread context with interrupts enabled, then call adc_dma_stop().
++ */
++bool furi_hal_rfid_adc_dma_wait_done(uint32_t timeout_ms);
++
+ #ifdef __cplusplus
+ }
+ #endif

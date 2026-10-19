@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/DarkFlippers/unleashed-firmware.git",
+  "tag": "unlshd-093",
+  "commit": "603f90d037c7e9db81b2b25736f8cdda28ea6ba8",
+  "hardware": "f7",
+  "api": "88.11",
+  "build_options": ["DEBUG=0", "COMPACT=1"],
+  "bundle_suffix": "u093-active",
+  "bundle_version": "u093-hitag2-active",
+  "modified_files": [
+    "targets/f7/api_symbols.csv",
+    "targets/f7/furi_hal/furi_hal_rfid.c",
+    "targets/f7/furi_hal/furi_hal_rfid.h"
+  ]
+}
